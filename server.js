@@ -1,10 +1,11 @@
 /**
  * ============================================================================
- * File Name: server.js (בתוך תיקיית הפרויקט של שרת ה-Gmail MCP)
+ * File Name: server.js
  * Description: שרת MCP המשלב גישה מאובטחת ל-Gmail דרך OAuth 2.0.
- * המערכת כוללת:
- * 1. Human-In-The-Loop (HITL) - טיוטה ואישור אנושי לפני שליחת מייל.
- * 2. Attachment Parsing - יכולת קריאת קבצים מצורפים (PDF, תמונות באמצעות OCR, וטקסט).
+ * כולל:
+ * 1. Human-In-The-Loop (HITL) לשליחת מיילים.
+ * 2. Attachment Vault - מנגנון חכם למניעת הזיות AI בשליפת מזהי קבצים.
+ * 3. קריאת קבצי PDF ותמונות (OCR).
  * ============================================================================
  */
 
@@ -15,10 +16,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import { google } from "googleapis";
-import pdfParse from "pdf-parse"; // ספרייה לקריאת קבצי PDF
-import Tesseract from "tesseract.js"; // ספרייה לזיהוי טקסט מתמונות (OCR)
+import pdfParse from "pdf-parse";
+import Tesseract from "tesseract.js";
 
-// הגנה מפני קריסות פתאומיות בשרת
 process.on("uncaughtException", (error) =>
   console.error("Prevented Crash:", error),
 );
@@ -26,9 +26,6 @@ process.on("unhandledRejection", (reason) =>
   console.error("Prevented Crash:", reason),
 );
 
-// ==========================================
-// חלק 1: הגדרת האבטחה והחיבור ל-Gmail (OAuth 2.0)
-// ==========================================
 const oauth2Client = new google.auth.OAuth2(
   process.env.GMAIL_CLIENT_ID,
   process.env.GMAIL_CLIENT_SECRET,
@@ -41,9 +38,6 @@ oauth2Client.setCredentials({
 
 const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-// ==========================================
-// פונקציית עזר: איתור קבצים מצורפים בתוך מבנה המייל
-// ==========================================
 function extractAttachments(parts) {
   let attachments = [];
   if (!parts) return attachments;
@@ -55,7 +49,6 @@ function extractAttachments(parts) {
         mimeType: part.mimeType,
       });
     }
-    // חיפוש רקורסיבי (למקרה שהקובץ חבוי עמוק בשרשור)
     if (part.parts) {
       attachments.push(...extractAttachments(part.parts));
     }
@@ -64,20 +57,22 @@ function extractAttachments(parts) {
 }
 
 // ==========================================
-// חלק 2: מנגנון הכלים (MCP)
+// כספות הזיכרון שלנו (Vaults)
 // ==========================================
-const pendingEmails = new Map();
+const pendingEmails = new Map(); // כספת לטיוטות של ה-HITL
+const attachmentVault = new Map(); // כספת לקבצים מצורפים
+let attachmentCounter = 1; // מונה קבצים ליצירת מזהים קצרים
 
 function createGmailSessionServer() {
   const server = new McpServer({
-    name: "Gmail Service (HITL & Attachments)",
-    version: "1.1.0",
+    name: "Gmail Service (Pro)",
+    version: "1.2.0",
   });
 
-  // --- כלי מס' 1: קריאת אימיילים (כולל דיווח על קבצים מצורפים) ---
+  // --- כלי מס' 1: קריאת אימיילים (ושמירת קבצים בכספת) ---
   server.tool(
     "read_emails",
-    "Fetches recent emails from the inbox. Returns sender, subject, body snippet, and importantly: a list of ATTACHMENTS with their IDs.",
+    "Fetches recent emails. Returns sender, subject, body, and a list of ATTACHMENTS. If there are attachments, use the short 'ATT-X' ID with get_attachment tool.",
     {
       limit: z
         .number()
@@ -111,18 +106,22 @@ function createGmailSessionServer() {
           const from =
             headers.find((h) => h.name === "From")?.value || "לא ידוע";
 
-          // שולפים את הקבצים המצורפים אם ישנם
           const attachments = extractAttachments(payload.parts);
-          let attachStr =
-            attachments.length > 0
-              ? `\n📎 קבצים מצורפים:\n` +
-                attachments
-                  .map(
-                    (a) =>
-                      `   - קובץ: ${a.filename} | ID: ${a.id} | סוג: ${a.mimeType}`,
-                  )
-                  .join("\n")
-              : "";
+          let attachStr = "";
+
+          if (attachments.length > 0) {
+            attachStr = `\n📎 קבצים מצורפים (כדי לקרוא אותם, הפעל get_attachment עם ה-ID הקצר):\n`;
+            for (const a of attachments) {
+              const shortId = `ATT-${attachmentCounter++}`;
+              // שמירת המזהה הארוך והמכוער בכספת!
+              attachmentVault.set(shortId, {
+                realAttachmentId: a.id,
+                messageId: msg.id,
+                mimeType: a.mimeType,
+              });
+              attachStr += `   - קובץ: ${a.filename} | ID: ${shortId} | סוג: ${a.mimeType}\n`;
+            }
+          }
 
           emailsText += `📧 מאת: ${from}\nנושא: ${subject}\nID המייל: ${msg.id}${attachStr}\n---\n`;
         }
@@ -133,36 +132,46 @@ function createGmailSessionServer() {
     },
   );
 
-  // --- כלי מס' 2 (חדש): קריאת קבצים מצורפים ---
+  // --- כלי מס' 2: קריאת קבצים מצורפים (דרך המזהה הקצר) ---
   server.tool(
     "get_attachment",
-    "Downloads and reads an attachment from an email. Use this when the user asks to summarize a PDF, read an invoice, or analyze an attached image. You MUST provide the messageId and attachmentId.",
+    "Downloads and reads an attachment. You MUST provide ONLY the short ID (e.g., ATT-1) found in the read_emails output.",
     {
-      messageId: z.string().describe("The ID of the email message"),
-      attachmentId: z
+      shortId: z
         .string()
-        .describe("The ID of the attachment (found via read_emails)"),
-      mimeType: z
-        .string()
-        .describe("The type of the file (e.g. application/pdf, image/jpeg)"),
+        .describe("The short ID of the attachment (e.g. ATT-1)"),
     },
-    async ({ messageId, attachmentId, mimeType }) => {
-      console.log(`>>> [MCP] Fetching attachment... Type: ${mimeType}`);
+    async ({ shortId }) => {
+      // שליפת הנתונים האמיתיים מהכספת
+      const attachData = attachmentVault.get(shortId);
+      if (!attachData) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Attachment ID '${shortId}' not found. Please read emails first.`,
+            },
+          ],
+        };
+      }
+
+      const { realAttachmentId, messageId, mimeType } = attachData;
+      console.log(
+        `>>> [MCP] Fetching attachment ${shortId}... Type: ${mimeType}`,
+      );
+
       try {
-        // 1. הורדת הקובץ מגוגל (מגיע בקידוד Base64 URL Safe)
         const attachRes = await gmail.users.messages.attachments.get({
           userId: "me",
           messageId: messageId,
-          id: attachmentId,
+          id: realAttachmentId,
         });
 
-        // 2. תרגום הקידוד למידע גולמי (Buffer)
         const base64Data = attachRes.data.data
           .replace(/-/g, "+")
           .replace(/_/g, "/");
         const buffer = Buffer.from(base64Data, "base64");
 
-        // 3. פענוח הקובץ לפי סוג (PDF, תמונה או טקסט)
         let extractedText = "";
 
         if (mimeType === "application/pdf") {
@@ -170,10 +179,7 @@ function createGmailSessionServer() {
           const pdfData = await pdfParse(buffer);
           extractedText = pdfData.text;
         } else if (mimeType.startsWith("image/")) {
-          console.log(
-            ">>> [MCP] Running OCR on Image (might take a few seconds)...",
-          );
-          // מריצים OCR לזיהוי טקסט (אנגלית ועברית)
+          console.log(">>> [MCP] Running OCR on Image...");
           const { data } = await Tesseract.recognize(buffer, "eng+heb");
           extractedText = data.text;
         } else if (
@@ -181,14 +187,13 @@ function createGmailSessionServer() {
           mimeType === "application/json" ||
           mimeType === "text/csv"
         ) {
-          console.log(">>> [MCP] Reading plain text file...");
           extractedText = buffer.toString("utf8");
         } else {
           return {
             content: [
               {
                 type: "text",
-                text: `Error: File type '${mimeType}' is not supported for automatic reading.`,
+                text: `Error: File type '${mimeType}' is not supported for reading.`,
               },
             ],
           };
@@ -199,7 +204,7 @@ function createGmailSessionServer() {
             content: [
               {
                 type: "text",
-                text: "The file was opened, but no readable text could be extracted. It might be a scanned document without embedded text.",
+                text: "The file was opened, but no readable text could be extracted.",
               },
             ],
           };
@@ -209,7 +214,7 @@ function createGmailSessionServer() {
           content: [
             {
               type: "text",
-              text: `Here is the extracted text from the attachment:\n\n${extractedText}\n\n--- End of file. You can now summarize or analyze this data for the user.`,
+              text: `Extracted text from ${shortId}:\n\n${extractedText}\n\n--- End of file. Analyze this data for the user.`,
             },
           ],
         };
@@ -230,26 +235,21 @@ function createGmailSessionServer() {
   // --- כלי מס' 3 (HITL): יצירת טיוטה ---
   server.tool(
     "draft_email",
-    "Creates a draft of an email. YOU MUST USE THIS FIRST BEFORE SENDING. Show the drafted content to the user and explicitly ask for their permission to send it.",
+    "Creates a draft of an email. Show content to user and ask permission.",
     {
-      to: z.string().email().describe("Recipient email address"),
-      subject: z.string().describe("Email subject"),
-      body: z.string().describe("Main email content"),
+      to: z.string().email(),
+      subject: z.string(),
+      body: z.string(),
     },
     async ({ to, subject, body }) => {
       const draftId =
         "DRAFT-" + Math.random().toString(36).substring(2, 8).toUpperCase();
       pendingEmails.set(draftId, { to, subject, body });
-      console.log(`>>> [HITL] Draft created: ${draftId} for ${to}`);
-
       return {
         content: [
           {
             type: "text",
-            text: `Draft successfully created and saved in server memory with ID: ${draftId}. 
-          CRITICAL INSTRUCTION: Show the user the exact 'to', 'subject', and 'body'. 
-          Then, ask the user: "האם תרצה שאשלח את האימייל הזה?". 
-          DO NOT proceed to send until the user says yes.`,
+            text: `Draft created: ${draftId}. Show user exact 'to', 'subject', 'body'. Ask: "האם תרצה שאשלח?". DO NOT send until user says yes.`,
           },
         ],
       };
@@ -259,29 +259,16 @@ function createGmailSessionServer() {
   // --- כלי מס' 4 (HITL): שליחת המייל ---
   server.tool(
     "send_confirmed_email",
-    "Actually sends an email. ONLY USE THIS TOOL if the user explicitly approved the draft.",
-    {
-      draftId: z
-        .string()
-        .describe(
-          "The Draft ID returned from the draft_email tool (e.g. DRAFT-X4G1)",
-        ),
-    },
+    "Actually sends an email. ONLY use if user approved the draft.",
+    { draftId: z.string() },
     async ({ draftId }) => {
       const emailData = pendingEmails.get(draftId);
-
-      if (!emailData) {
+      if (!emailData)
         return {
           content: [
-            {
-              type: "text",
-              text: `Error: Draft ${draftId} not found or already sent.`,
-            },
+            { type: "text", text: `Error: Draft ${draftId} not found.` },
           ],
         };
-      }
-
-      console.log(`>>> [HITL] Approval received! Sending ${draftId}...`);
 
       try {
         const utf8Subject = `=?utf-8?B?${Buffer.from(emailData.subject).toString("base64")}?=`;
@@ -303,22 +290,15 @@ function createGmailSessionServer() {
           userId: "me",
           requestBody: { raw: encodedMessage },
         });
-
         pendingEmails.delete(draftId);
-
         return {
           content: [
-            {
-              type: "text",
-              text: `✅ האימייל נשלח בהצלחה לנמען ${emailData.to}!`,
-            },
+            { type: "text", text: `✅ נשלח בהצלחה לנמען ${emailData.to}!` },
           ],
         };
       } catch (error) {
         return {
-          content: [
-            { type: "text", text: `❌ שגיאה בשליחה: ${error.message}` },
-          ],
+          content: [{ type: "text", text: `❌ שגיאה: ${error.message}` }],
         };
       }
     },
@@ -327,9 +307,6 @@ function createGmailSessionServer() {
   return server;
 }
 
-// ==========================================
-// חלק 3: מרכזיית הלקוחות (Express & SSE)
-// ==========================================
 const app = express();
 app.use(cors());
 
@@ -338,11 +315,8 @@ const transports = new Map();
 app.get("/sse", async (req, res) => {
   const transport = new SSEServerTransport("/messages", res);
   transports.set(transport.sessionId, transport);
-
   const sessionServer = createGmailSessionServer();
-
   req.on("close", () => transports.delete(transport.sessionId));
-
   try {
     await sessionServer.connect(transport);
   } catch (e) {}
@@ -351,7 +325,6 @@ app.get("/sse", async (req, res) => {
 app.post("/messages", async (req, res) => {
   const transport = transports.get(req.query.sessionId);
   if (!transport) return res.status(503).send("No active connection");
-
   try {
     await transport.handlePostMessage(req, res);
   } catch (e) {}
